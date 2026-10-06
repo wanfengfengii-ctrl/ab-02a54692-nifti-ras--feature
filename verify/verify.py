@@ -5,7 +5,8 @@ Aggregates three stages into the process exit code (bit flags):
 * bit 0 (1): unit/integration tests (``tests/``) failed
 * bit 1 (2): image build validation failed (manifest, runtime, imports)
 * bit 2 (4): API smoke failed (big/little endian x sform/qform x
-  int16/float32 sample matrix plus negative cases)
+  int16/float32 sample and sphere-stats matrices plus structural,
+  per-point and per-region negative cases)
 
 Exit code 0 means every stage passed.  The smoke stage waits for the API
 service to report readiness on ``/healthz`` before sending traffic.
@@ -25,8 +26,9 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from verify.httpclient import post_sample  # noqa: E402
+from verify.httpclient import post_sample, post_sphere_stats  # noqa: E402
 from verify.nifti_gen import build_nifti  # noqa: E402
+from app.nifti import parse_nifti  # noqa: E402
 
 EXIT_TESTS = 1
 EXIT_IMAGE = 2
@@ -282,6 +284,137 @@ def stage_smoke(base_url):
         check(f"negative[points {name}]: 400/invalid_points",
               status == 400 and err.get("code") == "invalid_points"
               and err.get("field") == "points",
+              f"got {status}: {payload}")
+
+    # =====================================================================
+    # sphere-stats: endianness x transform x datatype matrix
+    # =====================================================================
+    for endian, transform, datatype in combos:
+        tag = f"sphere {'LE' if endian == '<' else 'BE'}/{transform}/{datatype}"
+        affine = SFORM_AFFINE if transform == "sform" else QFORM_AFFINE
+        raw = build_nifti(
+            endian=endian, datatype=datatype, dims=DIMS, data_fn=data_fn,
+            transform=transform, slope=SLOPE, inter=INTER,
+            srow_x=SFORM_AFFINE[0], srow_y=SFORM_AFFINE[1], srow_z=SFORM_AFFINE[2],
+            quatern=QUATERN_90Z, qoffset=(10.0, 20.0, 30.0),
+            pixdim=(1.0, 2.0, 3.0, 4.0),
+        )
+        # Adjudicate the closed surface through the SAME affine the server
+        # rebuilds from the float32 header fields (its first column norm can
+        # differ from the ideal 2 mm by a float32 ulp).
+        parsed_affine = parse_nifti(raw).affine
+        surface_radius = math.sqrt(sum(parsed_affine[r][0] ** 2 for r in range(3)))
+        regions = [
+            # single-center ball: nearest surface neighbor is ~2 mm away
+            {"id": 20, "center": list(world_of(affine, (1, 2, 3))), "radius": 1.9},
+            # radius exactly the parsed first-column norm, centered on voxel
+            # (2,2,2): the +/- i neighbours lie precisely on the surface
+            {"id": 21, "center": list(world_of(parsed_affine, (2, 2, 2))),
+             "radius": surface_radius},
+            # ball misses the image entirely
+            {"id": 22, "center": [9.0e5, 9.0e5, 9.0e5], "radius": 1.0},
+        ]
+        status, payload = post_sphere_stats(base_url, raw, regions)
+        if not check(f"{tag}: HTTP 200", status == 200, f"got {status}: {payload}"):
+            continue
+        check(f"{tag}: transform source", isinstance(payload, dict)
+              and payload.get("transform") == transform,
+              repr(payload and payload.get("transform")))
+        results = payload.get("results") if isinstance(payload, dict) else None
+        if not check(f"{tag}: result count/order", isinstance(results, list)
+                     and [r.get("id") for r in results] == [20, 21, 22],
+                     repr(results)):
+            continue
+        by_id = {r.get("id"): r for r in results}
+        r20 = by_id[20]
+        want_single = data_fn(1, 2, 3) * SLOPE + INTER
+        check(f"{tag}: single-center stats",
+              r20.get("status") == "ok" and r20.get("count") == 1
+              and abs(r20.get("min", 0.0) - want_single) <= 1e-3
+              and abs(r20.get("max", 0.0) - want_single) <= 1e-3
+              and abs(r20.get("mean", 0.0) - want_single) <= 1e-3
+              and r20.get("transform") == transform,
+              repr(r20))
+        r21 = by_id[21]
+        vals21 = sorted(data_fn(i, 2, 2) for i in (1, 2, 3))
+        want21 = [v * SLOPE + INTER for v in vals21]
+        check(f"{tag}: closed-surface ball count 3",
+              r21.get("status") == "ok" and r21.get("count") == 3
+              and abs(r21.get("min") - want21[0]) <= 1e-3
+              and abs(r21.get("max") - want21[-1]) <= 1e-3
+              and abs(r21.get("mean") - sum(want21) / 3.0) <= 1e-3,
+              repr(r21))
+        r22 = by_id[22]
+        check(f"{tag}: empty region per-id error",
+              r22.get("status") == "error"
+              and r22.get("error", {}).get("code") == "empty_region",
+              repr(r22))
+
+    # non-finite voxel: only the enclosing region fails -------------------
+    raw = build_nifti(**{**base,
+                         "data_fn": lambda i, j, k: float("nan") if (i, j, k) == (1, 1, 1)
+                         else data_fn(i, j, k)})
+    regions = [
+        {"id": 30, "center": list(world_of(SFORM_AFFINE, (1, 1, 1))), "radius": 1.0},
+        {"id": 31, "center": list(world_of(SFORM_AFFINE, (3, 4, 5))), "radius": 1.9},
+    ]
+    status, payload = post_sphere_stats(base_url, raw, regions)
+    results = {r.get("id"): r for r in payload.get("results", [])} \
+        if isinstance(payload, dict) else {}
+    r30, r31 = results.get(30, {}), results.get(31, {})
+    check("sphere non-finite: region 30 flagged with voxel",
+          status == 200 and r30.get("status") == "error"
+          and r30.get("error", {}).get("code") == "non_finite_data"
+          and r30.get("error", {}).get("voxel") == [1, 1, 1],
+          f"got {status}: {payload}")
+    check("sphere non-finite: region 31 unaffected",
+          r31.get("status") == "ok" and r31.get("count") == 1
+          and abs((r31.get("mean") or 0.0) - data_fn(3, 4, 5)) <= 1e-3,
+          repr(r31))
+
+    # over-capacity region: 41^3 = 68921 > 65536 centers --------------------
+    n = 41
+    big = build_nifti(endian="<", datatype="int16", dims=(n, n, n),
+                      data_fn=lambda i, j, k: 1,
+                      srow_x=(1.0, 0.0, 0.0, 0.0),
+                      srow_y=(0.0, 1.0, 0.0, 0.0),
+                      srow_z=(0.0, 0.0, 1.0, 0.0))
+    h = (n - 1) / 2.0
+    regions = [
+        {"id": 40, "center": [h, h, h], "radius": math.sqrt(3.0) * h},
+        {"id": 41, "center": [0.0, 0.0, 0.0], "radius": 0.5},
+    ]
+    status, payload = post_sphere_stats(base_url, big, regions)
+    results = {r.get("id"): r for r in payload.get("results", [])} \
+        if isinstance(payload, dict) else {}
+    r40, r41 = results.get(40, {}), results.get(41, {})
+    check("sphere capacity: oversized region flagged",
+          status == 200 and r40.get("status") == "error"
+          and r40.get("error", {}).get("code") == "region_too_large",
+          f"got {status}: {payload}")
+    check("sphere capacity: sibling region unaffected",
+          r41.get("status") == "ok" and r41.get("count") == 1, repr(r41))
+
+    # invalid regions payloads ---------------------------------------------
+    raw = build_nifti(**base)
+    bad_regions = [
+        ("duplicate ids", [{"id": 1, "center": [0, 0, 0], "radius": 1.0},
+                           {"id": 1, "center": [1, 1, 1], "radius": 1.0}]),
+        ("zero regions", []),
+        ("33 regions", [{"id": i, "center": [0, 0, 0], "radius": 1.0}
+                        for i in range(33)]),
+        ("non-finite center", [{"id": 1, "center": [float("inf"), 0, 0],
+                                "radius": 1.0}]),
+        ("zero radius", [{"id": 1, "center": [0, 0, 0], "radius": 0.0}]),
+        ("negative radius", [{"id": 1, "center": [0, 0, 0], "radius": -2.0}]),
+        ("malformed JSON", b"[{"),
+    ]
+    for name, regions_payload in bad_regions:
+        status, payload = post_sphere_stats(base_url, raw, regions_payload)
+        err = payload.get("error", {}) if isinstance(payload, dict) else {}
+        check(f"negative[regions {name}]: 400/invalid_regions",
+              status == 400 and err.get("code") == "invalid_regions"
+              and err.get("field") == "regions",
               f"got {status}: {payload}")
 
     ok = not failures

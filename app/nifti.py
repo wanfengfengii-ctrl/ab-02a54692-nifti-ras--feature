@@ -61,7 +61,10 @@ class NiftiVolume:
     def value_at(self, i, j, k):
         """Scaled voxel value at integer indices (NIfTI: first dim fastest)."""
         nx, ny, _ = self.dims
-        raw = self.data[i + nx * (j + ny * k)]
+        return self.scale_value(self.data[i + nx * (j + ny * k)])
+
+    def scale_value(self, raw):
+        """Apply the NIfTI scaling rule to one raw stored value."""
         if self.scl_slope != 0.0:
             return raw * self.scl_slope + self.scl_inter
         return float(raw)
