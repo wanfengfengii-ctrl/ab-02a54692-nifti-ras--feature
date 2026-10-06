@@ -1,8 +1,9 @@
 # nifti-sampler
 
 神经影像质控平台的体数据抽查服务：按扫描仪 RAS 世界坐标对三维 NIfTI-1
-体数据做三线性插值采样。严格校验方向矩阵（sform/qform）、字节序与强度
-缩放，避免核对到错误体素。纯 Python 标准库实现，无第三方依赖。
+体数据做三线性插值采样，并支持以 RAS 闭球为单位统计局部强度分布。
+严格校验方向矩阵（sform/qform）、字节序与强度缩放，避免核对到错误体素。
+纯 Python 标准库实现，无第三方依赖。
 
 ## API
 
@@ -53,6 +54,7 @@ curl -F "file=@vol.nii" \
 | `invalid_multipart` | 400/415 | — | 表单结构非法 |
 | `missing_file` / `multiple_files` | 400 | `file` | 文件部分缺失/多于一个 |
 | `missing_points` / `invalid_points` | 400 | `points` | 坐标字段缺失、数量越界、id 重复/非法、坐标非有限（message 含点号） |
+| `missing_regions` / `invalid_regions` | 400 | `regions` | 区域字段缺失、数量越界（非 1–32）、id 重复/非法、center 非有限或 radius 非正有限（message 含编号） |
 | `file_too_large` | 413 | `file` | 超过 16 MiB |
 | `header_too_short` | 400 | `file` | 不足 348 字节头部 |
 | `bad_sizeof_hdr` | 400 | `sizeof_hdr` | 两种字节序下都不是 348 |
@@ -72,6 +74,58 @@ curl -F "file=@vol.nii" \
 逐点错误（200 响应内）：`out_of_bounds`（逆变换后落在体素中心闭域
 `[0, n-1]` 之外）、`non_finite_data`（插值邻域内缩放后数据非有限）。
 
+### `POST /api/nifti/sphere-stats`
+
+供质控人员查看标记点周围的局部强度分布，避免单点读数被噪声、坏体素或
+各向异性扫描网格误导。`multipart/form-data`，包含：
+
+| 部分 | 说明 |
+| --- | --- |
+| 文件部分（任意字段名，须带 `filename`） | 单个 NIfTI-1 `.nii` 文件，≤ 16 MiB（沿用采样接口限制） |
+| `regions` 字段 | JSON 数组，1–32 个元素：`[{"id": 0, "center": [x, y, z], "radius": r}, ...]` |
+
+`id` 为 `[0, 2^31)` 内唯一整数；`center` 为三个有限数值（RAS 世界坐标）；
+`radius` 为**正**有限数值（世界单位，通常 mm）。每个区域按所选 sform 或
+qform 的世界空间**闭球**（`|x-c| <= r`）裁决**体素中心**：球可以越出影像，
+但只统计实际存在的体素；恰落在球面上的体素中心必须计入。单区最多纳入
+65536 个体素中心。
+
+```bash
+curl -F "file=@vol.nii" \
+     -F 'regions=[{"id": 1, "center": [12.0, 26.0, 42.0], "radius": 5.0}]' \
+     http://localhost:8000/api/nifti/sphere-stats
+```
+
+**成功响应（200）**，结果顺序与请求一致：
+
+```json
+{
+  "transform": "sform",
+  "results": [
+    {"id": 1, "status": "ok", "count": 51, "min": 12.0, "max": 902.0,
+     "mean": 411.6, "transform": "sform"},
+    {"id": 2, "status": "error",
+     "error": {"code": "empty_region", "message": "..."}}
+  ]
+}
+```
+
+每个成功区域给出 `count`（实际纳入的体素中心数）、`min`/`max`/`mean`
+（均基于已应用 `scl_slope`/`scl_inter` 缩放后的强度；均值用补偿求和计算）
+与所用变换来源（`transform`）。
+
+逐区错误（200 响应内，只影响对应编号、不遮蔽其余区域）：
+
+| code | 含义 |
+| --- | --- |
+| `empty_region` | 闭球内没有任何实际体素中心（球完全落在影像之外或过小） |
+| `region_capacity_exceeded` | 实际纳入的体素中心超过 65536 |
+| `non_finite_intensity` | 纳入的体素中存在缩放后非有限强度 |
+
+请求级错误另增 `invalid_regions`（400，`field="regions"`：数量越界、
+id 重复/非法、center 非有限、radius 非正有限）与 `missing_regions`
+（400，`field="regions"`）。文件级错误码与采样接口完全一致。
+
 ### `GET /healthz`
 
 就绪探针：服务启动时对采样流水线做自检，通过后才返回
@@ -89,6 +143,20 @@ curl -F "file=@vol.nii" \
 - 世界坐标经所选仿射的逆变换映射到连续体素坐标，须落在体素中心闭域
   `[0, n-1]`（各轴，含边界；另有 1e-6 体素的浮点容差）。对缩放后的 8 个
   邻近体素做三线性插值；边界轴固定到唯一端点（权重 1），零权重邻居不参与。
+
+## 闭球统计规则
+
+- 以区域中心与正半径在所选 sform/qform **世界空间**定义闭球
+  `|x - center| <= radius`；按体素中心的世界坐标裁决，闭球面计入
+  （另有 1e-12 相对距离容差吸收浮点误差）。
+- 候选范围由逆仿射行向量导出椭球包围盒（各向异性网格下仍是保守盒），只对
+  盒内体素做精确距离复核。
+- 球可越出影像；仅统计实际存在于 `[0, nx-1] × [0, ny-1] × [0, nz-1]`
+  的体素中心，因此各向异性体素尺寸由仿射自动正确处理。
+- 强度沿用采样接口的缩放规则（`raw * scl_slope + scl_inter`，
+  `scl_slope == 0` 时取原始值）；均值采用补偿求和，最多 65536 个样本。
+- 空区域、超过 65536 个中心或区域内出现非有限缩放强度时，仅对应编号返回
+  逐区错误，其余区域统计不受影响。
 
 ## 运行
 
@@ -116,8 +184,8 @@ docker compose up --build --exit-code-from verify verify
 | 位 | 值 | 阶段 |
 | --- | --- | --- |
 | bit0 | 1 | 代码测试（`tests/` 单元 + 集成测试） |
-| bit1 | 2 | 镜像构建校验（构建清单、运行时版本、模块导入、采样自检） |
-| bit2 | 4 | API 冒烟（大/小端 × sform/qform × int16/float32 样本矩阵 + 结构错误与逐点错误用例） |
+| bit1 | 2 | 镜像构建校验（构建清单、运行时版本、模块导入、采样/球统计自检） |
+| bit2 | 4 | API 冒烟（大/小端 × sform/qform × int16/float32 样本矩阵、采样与球统计 + 结构错误与逐点/逐区错误用例） |
 
 退出码 0 表示全部通过。本地复现（stage 2 需要镜像构建清单
 `image-manifest.json`，仅在 Dockerfile 构建时生成）：
@@ -130,7 +198,7 @@ VERIFY_BASE_URL=http://127.0.0.1:8000 python -m verify.verify
 ## 目录结构
 
 ```
-app/            服务实现（server: HTTP/multipart；nifti: 头部解析校验；sampling: 插值）
+app/            服务实现（server: HTTP/multipart；nifti: 头部解析校验；sampling: 插值；spheres: 闭球统计）
 tests/          单元与集成测试（stdlib unittest）
 verify/         一次性校验服务 + NIfTI 样本生成器 + multipart 客户端
 Dockerfile      单阶段镜像（python:3.11-slim，无外部依赖）

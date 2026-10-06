@@ -8,6 +8,9 @@ Two error levels exist:
 * :class:`PointError` — per-point sampling failure.  Reported inside a
   200 response next to the point id so one bad point never hides the
   remaining results.
+* :class:`RegionError` — per-region sphere-statistics failure.  Reported
+  inside a 200 response next to the region id so one empty/oversized/
+  non-finite region never hides the remaining results.
 """
 
 
@@ -36,3 +39,12 @@ class PointError(Exception):
         self.code = code
         self.message = message
         self.voxel = voxel
+
+
+class RegionError(Exception):
+    """Per-region sphere-statistics failure (reported inside a 200 response)."""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+        self.message = message

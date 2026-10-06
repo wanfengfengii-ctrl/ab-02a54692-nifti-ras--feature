@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from verify.httpclient import post_sample  # noqa: E402
+from verify.httpclient import post_sample, post_sphere_stats  # noqa: E402
 from verify.nifti_gen import build_nifti  # noqa: E402
 
 EXIT_TESTS = 1
@@ -266,6 +266,143 @@ def stage_smoke(base_url):
           r11.get("status") == "ok"
           and abs((r11.get("intensity") or 0.0) - data_fn(3, 4, 5)) <= 1e-3,
           repr(r11))
+
+    # -- sphere-stats matrix: endianness x transform x datatype -------------
+    def brute_force_sphere(affine, center, radius, dims=DIMS):
+        nx, ny, nz = dims
+        vals = []
+        for k in range(nz):
+            for j in range(ny):
+                for i in range(nx):
+                    w = world_of(affine, (i, j, k))
+                    d2 = sum((w[a] - center[a]) ** 2 for a in range(3))
+                    if d2 <= radius * radius + 1e-9:
+                        vals.append(data_fn(i, j, k) * SLOPE + INTER)
+        return vals
+
+    for endian, transform, datatype in combos:
+        tag = f"sphere {'LE' if endian == '<' else 'BE'}/{transform}/{datatype}"
+        affine = SFORM_AFFINE if transform == "sform" else QFORM_AFFINE
+        raw = build_nifti(
+            endian=endian, datatype=datatype, dims=DIMS, data_fn=data_fn,
+            transform=transform, slope=SLOPE, inter=INTER,
+            srow_x=SFORM_AFFINE[0], srow_y=SFORM_AFFINE[1], srow_z=SFORM_AFFINE[2],
+            quatern=QUATERN_90Z, qoffset=(10.0, 20.0, 30.0),
+            pixdim=(1.0, 2.0, 3.0, 4.0),
+        )
+        origin = world_of(affine, (0, 0, 0))
+        clip_center = world_of(affine, (4, 5, 6))  # beyond last centre
+        regions = [
+            # tiny ball: exactly the (2,2,2) voxel
+            {"id": 30, "center": list(world_of(affine, (2, 2, 2))),
+             "radius": 1.0},
+            # ball reaching an axis neighbour at exactly 2 mm (closed)
+            {"id": 31, "center": list(origin), "radius": 2.0},
+            # empty region, well outside the image
+            {"id": 32, "center": [9000.0, 9000.0, 9000.0], "radius": 1.0},
+            # ball centred outside the image: clipped to actual voxels
+            {"id": 33, "center": list(clip_center), "radius": 8.0},
+        ]
+        status, payload = post_sphere_stats(base_url, raw, regions)
+        if not check(f"{tag}: HTTP 200", status == 200, f"got {status}: {payload}"):
+            continue
+        results = payload.get("results") if isinstance(payload, dict) else None
+        if not check(f"{tag}: result count/order", isinstance(results, list)
+                     and [r.get("id") for r in results] == [30, 31, 32, 33],
+                     repr(results)):
+            continue
+        check(f"{tag}: transform source", payload.get("transform") == transform,
+              repr(payload.get("transform")))
+        by_id = {r.get("id"): r for r in results}
+        want_single = data_fn(2, 2, 2) * SLOPE + INTER
+        r30 = by_id[30]
+        check(f"{tag}: single-voxel stats",
+              r30.get("status") == "ok" and r30.get("count") == 1
+              and r30.get("min") == want_single and r30.get("max") == want_single
+              and abs(r30.get("mean", 0.0) - want_single) <= 1e-3
+              and r30.get("transform") == transform, repr(r30))
+        r31 = by_id[31]
+        check(f"{tag}: closed-surface pair",
+              r31.get("status") == "ok" and r31.get("count") == 2
+              and r31.get("min") == INTER and r31.get("max") == 1.0 * SLOPE + INTER
+              and abs(r31.get("mean", -1) - (INTER + SLOPE / 2.0)) <= 1e-3,
+              repr(r31))
+        check(f"{tag}: empty region isolated",
+              by_id[32].get("status") == "error"
+              and by_id[32].get("error", {}).get("code") == "empty_region",
+              repr(by_id[32]))
+        want_clip = brute_force_sphere(affine, clip_center, 8.0)
+        r33 = by_id[33]
+        check(f"{tag}: clipped ball stats",
+              r33.get("status") == "ok"
+              and r33.get("count") == len(want_clip)
+              and abs(r33.get("min", 0.0) - min(want_clip)) <= 1e-3
+              and abs(r33.get("max", 0.0) - max(want_clip)) <= 1e-3
+              and abs(r33.get("mean", 0.0)
+                      - math.fsum(want_clip) / len(want_clip)) <= 1e-3,
+              f"want n={len(want_clip)}, got {r33}")
+
+    # -- sphere-stats non-finite voxel -> per-region error -------------------
+    raw = build_nifti(**{**base,
+                         "data_fn": lambda i, j, k: float("nan") if (i, j, k) == (1, 1, 1)
+                         else data_fn(i, j, k)})
+    regions = [
+        {"id": 40, "center": list(world_of(SFORM_AFFINE, (1, 1, 1))),
+         "radius": 1.0},
+        {"id": 41, "center": list(world_of(SFORM_AFFINE, (3, 4, 5))),
+         "radius": 1.0},
+    ]
+    status, payload = post_sphere_stats(base_url, raw, regions)
+    results = {r.get("id"): r for r in payload.get("results", [])} \
+        if isinstance(payload, dict) else {}
+    check("sphere non-finite: region 40 flagged",
+          status == 200 and results.get(40, {}).get("status") == "error"
+          and results[40]["error"].get("code") == "non_finite_intensity",
+          f"got {status}: {payload}")
+    r41 = results.get(41, {})
+    check("sphere non-finite: region 41 unaffected",
+          r41.get("status") == "ok" and r41.get("count") == 1
+          and abs(r41.get("mean", 0.0) - data_fn(3, 4, 5)) <= 1e-3, repr(r41))
+
+    # -- sphere-stats capacity: 64^3 int16 ball covers 262144 > 65536 -------
+    big = build_nifti(endian="<", datatype="int16", dims=(64, 64, 64),
+                      data_fn=lambda i, j, k: 1, transform="sform")
+    regions = [
+        {"id": 50, "center": [31.5, 31.5, 31.5], "radius": 1000.0},
+        {"id": 51, "center": [0.0, 0.0, 0.0], "radius": 0.1},
+    ]
+    status, payload = post_sphere_stats(base_url, big, regions)
+    results = {r.get("id"): r for r in payload.get("results", [])} \
+        if isinstance(payload, dict) else {}
+    check("sphere capacity: oversized region flagged",
+          status == 200 and results.get(50, {}).get("status") == "error"
+          and results[50]["error"].get("code") == "region_capacity_exceeded",
+          f"got {status}: {payload}")
+    check("sphere capacity: other region unaffected",
+          results.get(51, {}).get("status") == "ok"
+          and results[51].get("count") == 1, repr(results.get(51)))
+
+    # -- invalid regions payloads --------------------------------------------
+    raw = build_nifti(**base)
+    bad_regions = [
+        ("zero regions", []),
+        ("33 regions", [{"id": i, "center": [0, 0, 0], "radius": 1.0}
+                        for i in range(33)]),
+        ("duplicate ids", [{"id": 1, "center": [0, 0, 0], "radius": 1.0},
+                           {"id": 1, "center": [1, 1, 1], "radius": 1.0}]),
+        ("zero radius", [{"id": 1, "center": [0, 0, 0], "radius": 0.0}]),
+        ("non-finite radius", [{"id": 1, "center": [0, 0, 0],
+                                "radius": float("nan")}]),
+        ("bad center", [{"id": 1, "center": [0, 0], "radius": 1.0}]),
+        ("malformed JSON", b"[{"),
+    ]
+    for name, regions_payload in bad_regions:
+        status, payload = post_sphere_stats(base_url, raw, regions_payload)
+        err = payload.get("error", {}) if isinstance(payload, dict) else {}
+        check(f"negative[regions {name}]: 400/invalid_regions",
+              status == 400 and err.get("code") == "invalid_regions"
+              and err.get("field") == "regions",
+              f"got {status}: {payload}")
 
     # -- invalid points payloads ---------------------------------------------
     raw = build_nifti(**base)
